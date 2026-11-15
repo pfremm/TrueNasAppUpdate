@@ -1,15 +1,22 @@
 # TrueNAS SCALE App Updater
 
-A shell script that uses the TrueNAS SCALE 25.04 REST API to check for and apply app updates.
+A shell script that uses the TrueNAS **JSON-RPC 2.0 over WebSocket API** (SCALE
+25.04+; endpoint `/api/current`) to check for and apply app updates.
+
+API reference: <https://api.truenas.com/v25.10/jsonrpc.html>
 
 ---
 
 ## Requirements
 
-- `curl`
 - `jq`
+- `python3`
+- A Python WebSocket library — either:
+  - `pip install websockets` (preferred), or
+  - `pip install websocket-client`
 
-Both must be available in your `PATH` on the machine running the script.
+All must be available in your `PATH` on the machine running the script.
+(Note: `curl` is no longer needed.)
 
 ---
 
@@ -27,6 +34,9 @@ Export your credentials as environment variables (recommended for scripting and 
 export TRUENAS_HOST="https://192.168.1.100"
 export TRUENAS_API_KEY="your-api-key-here"
 ```
+
+A bare host or IP (`TRUENAS_HOST="192.168.1.100"`) also works — it is normalised
+to `wss://192.168.1.100/api/current`. `http://` becomes `ws://`.
 
 Alternatively, pass them directly via flags on each invocation (see [Options](#options)).
 
@@ -52,14 +62,14 @@ If no `app_name` arguments are given, all apps with available updates are target
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-h`, `--host HOST` | TrueNAS hostname or IP | `$TRUENAS_HOST` |
+| `-h`, `--host HOST` | TrueNAS host (`https://host[:port]`, bare host/IP, or `wss://` URI) | `$TRUENAS_HOST` |
 | `-k`, `--api-key KEY` | API key | `$TRUENAS_API_KEY` |
 | `-d`, `--dry-run` | List available updates without applying them | off |
 | `-y`, `--yes` | Skip the confirmation prompt | off |
 | `-n`, `--no-confirm` | Skip the confirmation prompt and print a structured results summary to stdout | off |
-| `--probe-api` | Print all available `/app/*` REST endpoints from the TrueNAS OpenAPI schema and exit (useful for debugging 404 errors) | off |
+| `--probe-api` | Print all `app.*` JSON-RPC methods and exit (debugging) | off |
 | `--no-verify-ssl` | Disable SSL certificate verification (for self-signed certs) | off |
-| `--timeout SECS` | Per-request curl timeout in seconds | `30` |
+| `--timeout SECS` | Per-call WebSocket timeout in seconds | `30` |
 | `--job-timeout SECS` | Max seconds to wait for an upgrade job to complete | `600` |
 | `--retries N` | Number of times to retry a failed upgrade before giving up | `3` |
 | `--retry-delay SECS` | Seconds to wait between retry attempts | `15` |
@@ -70,8 +80,9 @@ If no `app_name` arguments are given, all apps with available updates are target
 
 | Variable | Description |
 |----------|-------------|
-| `TRUENAS_HOST` | Base URL of your TrueNAS instance, e.g. `https://192.168.1.100` |
+| `TRUENAS_HOST` | Base URL or host of your TrueNAS instance, e.g. `https://192.168.1.100` |
 | `TRUENAS_API_KEY` | API key generated in the TrueNAS UI |
+| `TRUENAS_API_PATH` | WebSocket API path (default `/api/current`; override only if your deployment differs) |
 
 Flags passed on the command line take precedence over environment variables.
 
@@ -100,12 +111,12 @@ Flags passed on the command line take precedence over environment variables.
 ./truenas-update-apps.sh plex jellyfin
 
 # Specify credentials inline and skip SSL verification
-./truenas-update-apps.sh --host https://192.168.1.100 --api-key mykey --no-verify-ssl
+./truenas-update-apps.sh --host 192.168.1.100 --api-key mykey --no-verify-ssl
 
 # Dry-run for a single app with a longer job timeout
 ./truenas-update-apps.sh --dry-run --job-timeout 900 sonarr
 
-# Discover available /app/* REST endpoints (useful when upgrades return 404)
+# List every app.* method the server exposes (debugging)
 ./truenas-update-apps.sh --probe-api
 
 # Disable retries (fail immediately on first error)
@@ -119,41 +130,53 @@ Flags passed on the command line take precedence over environment variables.
 
 ## How It Works
 
-| Step | API Endpoint |
-|------|--------------|
-| Verify connectivity | `GET /api/v2.0/system/info` |
-| List installed apps | `GET /api/v2.0/app` |
+All communication is JSON-RPC 2.0 over a WebSocket connection
+(`wss://<host>/api/current`), authenticated once per call with
+`auth.login_with_api_key`:
+
+| Step | JSON-RPC method |
+|------|-----------------|
+| Verify connectivity | `system.info` |
+| List installed apps | `app.query` |
 | Filter upgradeable apps | Client-side via `jq` (`upgrade_available == true`) |
-| Start upgrade (tried in order, first success wins) | See below |
-| Poll job status | `GET /api/v2.0/core/get_jobs?id={job_id}` |
-| Fetch failure log (on job error) | `GET /api/v2.0/filesystem/get?path=<log_path>` |
+| Start upgrade | `app.upgrade` (a job — blocks until done, progress streamed live) |
+| Start a stopped app | `app.start` (also a job) |
+| Fetch failure log excerpt | `core.get_jobs` (`logs_excerpt`) |
 
-### Upgrade endpoint fallback chain
+### Job progress
 
-TrueNAS SCALE 25.04 exposes different upgrade endpoints depending on whether an app has a new catalog version or only new Docker image tags. The script tries each in order until one succeeds:
+`app.upgrade` and `app.start` are server-side jobs. The script keeps the
+WebSocket open while the job runs and renders live progress (state/percent,
+from the `core.get_jobs` collection events) as it arrives, then confirms
+completion when the final JSON-RPC result lands.
 
-| # | Endpoint | Body | Use case |
-|---|----------|------|----------|
-| A | `POST /app/{name}/upgrade` | `{}` | New app definition version in the TrueNAS catalog |
-| B | `POST /app/{name}/pull_images` | `{"redeploy": true}` | New Docker image tags, same app definition version |
-| C | `POST /app/upgrade` | `{"app_name": "…"}` | Alternative REST mapping used by some 25.04 builds |
-| D | `POST /app/pull_images` | `{"app_name": "…", "options": {"redeploy": true}}` | Alternative image-pull mapping |
+### Automatic log excerpt on failure
 
-### Automatic log fetching on failure
-
-When TrueNAS reports a job failure and the error message references a log file (e.g. `/var/log/app_lifecycle.log`), the script automatically fetches the last 40 lines of that file via the TrueNAS filesystem API and prints them inline. If the API fetch fails, it prints the equivalent SSH command instead:
-
-```
-ssh root@nas.pfrem.me "tail -50 /var/log/app_lifecycle.log"
-```
+When an upgrade job fails, the script looks up the job via `core.get_jobs` and
+prints the middleware-captured `logs_excerpt` inline (last 40 lines). If
+TrueNAS captured no excerpt, it prints a hint pointing at the TrueNAS UI (Jobs)
+and an equivalent `ssh tail` command.
 
 ### Stopped-app handling
 
-Before upgrading any app whose state is `STOPPED`, the script calls `POST /api/v2.0/app/{name}/start` and waits for it to finish. If the start fails for any reason the upgrade is still attempted — the start step is non-fatal.
+Before upgrading any app whose state is `STOPPED`, the script calls
+`app.start` and waits for it to finish. If the start fails for any reason the
+upgrade is still attempted — the start step is non-fatal.
+
+### Error classification
+
+JSON-RPC errors are flattened from the standard error envelope
+(`code` / `message` / `data.reason` / `data.errname`) and classified:
+
+- `[EINVAL]` configuration errors → no retry (fix in the TrueNAS UI first)
+- "stopped state" errors → the app is started, then the upgrade retried
+- anything else → retried up to `--retries` times
 
 ### Iterative upgrade passes
 
-After every pass the script re-checks TrueNAS for new `upgrade_available` apps (up to **10 passes**). This handles cases where updating one app unlocks an update for another. The loop stops when:
+After every pass the script re-checks TrueNAS for new `upgrade_available`
+apps (up to **10 passes**). This handles cases where updating one app unlocks
+an update for another. The loop stops when:
 
 - TrueNAS reports no more upgradeable apps, **or**
 - A full pass produces zero successful upgrades (persistent failure — no point retrying), **or**
@@ -161,7 +184,7 @@ After every pass the script re-checks TrueNAS for new `upgrade_available` apps (
 
 The confirmation prompt is shown **once** before the first pass only.
 
-Updates within each pass are applied sequentially. The script polls each upgrade job until it reports `SUCCESS`, `FAILED`, or `ABORTED`, or until `--job-timeout` is reached.
+Updates within each pass are applied sequentially.
 
 ---
 
@@ -198,18 +221,20 @@ Failed    : 1
 ============================================================
 ```
 
-This makes it easy to capture or pipe just the results while letting the normal progress log go to a separate file.
+This makes it easy to capture or pipe just the results while letting the
+normal progress log go to a separate file.
 
 ---
 
 ## Cron Example
 
-Run every night at 3 AM. Use `--no-confirm` to capture a clean results summary in its own log, with full progress detail going to a separate file:
+Run every night at 3 AM. Use `--no-confirm` to capture a clean results summary
+in its own log, with full progress detail going to a separate file:
 
 ```cron
 # Full progress log + results summary in one file
-0 3 * * * TRUENAS_HOST=https://192.168.1.100 TRUENAS_API_KEY=your-key /path/to/truenas-update-apps.sh --no-confirm >> /var/log/truenas-updates.log 2>&1
+0 3 * * * TRUENAS_HOST=192.168.1.100 TRUENAS_API_KEY=your-key /path/to/truenas-update-apps.sh --no-confirm >> /var/log/truenas-updates.log 2>&1
 
 # Or use --yes if you only want the progress log (no results block)
-0 3 * * * TRUENAS_HOST=https://192.168.1.100 TRUENAS_API_KEY=your-key /path/to/truenas-update-apps.sh --yes >> /var/log/truenas-updates.log 2>&1
+0 3 * * * TRUENAS_HOST=192.168.1.100 TRUENAS_API_KEY=your-key /path/to/truenas-update-apps.sh --yes >> /var/log/truenas-updates.log 2>&1
 ```
