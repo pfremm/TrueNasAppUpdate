@@ -7,6 +7,18 @@ API reference: <https://api.truenas.com/v25.10/jsonrpc.html>
 
 ---
 
+## Minimum TrueNAS Version
+
+> **Requires TrueNAS SCALE 25.04 (Fangtooth) or newer.**
+>
+> 25.04 is the first release exposing the JSON-RPC 2.0 over WebSocket API at
+> `/api/current`. TrueNAS 25.10 (Goldeye) **removed the legacy REST API**
+> entirely, so older versions of this script stop working on 25.10; this
+> version requires 25.04+ and no longer supports 24.10 (Electric Eel) or
+> earlier REST-only releases.
+
+---
+
 ## Requirements
 
 - `jq`
